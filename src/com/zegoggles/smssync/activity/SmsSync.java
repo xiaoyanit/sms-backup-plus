@@ -51,6 +51,7 @@ import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import com.squareup.otto.Subscribe;
 import com.zegoggles.smssync.App;
 import com.zegoggles.smssync.Consts;
 import com.zegoggles.smssync.R;
@@ -65,10 +66,14 @@ import com.zegoggles.smssync.preferences.BackupManagerWrapper;
 import com.zegoggles.smssync.preferences.PrefStore;
 import com.zegoggles.smssync.receiver.SmsBroadcastReceiver;
 import com.zegoggles.smssync.service.Alarms;
+import com.zegoggles.smssync.service.BackupStateChanged;
+import com.zegoggles.smssync.service.RestoreStateChanged;
 import com.zegoggles.smssync.service.ServiceBase;
-import com.zegoggles.smssync.service.ServiceBase.SmsSyncState;
 import com.zegoggles.smssync.service.SmsBackupService;
 import com.zegoggles.smssync.service.SmsRestoreService;
+import com.zegoggles.smssync.service.SmsSyncState;
+import com.zegoggles.smssync.service.StateChanged;
+import com.zegoggles.smssync.service.UserCanceled;
 import com.zegoggles.smssync.utils.AppLog;
 import com.zegoggles.smssync.utils.Utils;
 import oauth.signpost.OAuth;
@@ -121,13 +126,9 @@ public class SmsSync extends PreferenceActivity {
     private StatusPreference statusPref;
     private Uri mAuthorizeUri = null;
 
-
-
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        ServiceBase.smsSync = this;
-
         PrefStore.upgradeCredentials(this);
 
         addPreferencesFromResource(R.xml.main_screen);
@@ -177,8 +178,6 @@ public class SmsSync extends PreferenceActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        ServiceBase.smsSync = this;
-
         initCalendarAndGroups();
 
         updateLastBackupTimes();
@@ -468,9 +467,10 @@ public class SmsSync extends PreferenceActivity {
             super(context);
             setSelectable(false);
             setOrder(0);
+            App.bus.register(this);
         }
 
-        public void update() {
+        private void update() {
             stateChanged(ServiceBase.getState());
         }
 
@@ -490,8 +490,8 @@ public class SmsSync extends PreferenceActivity {
             mProgressBar.setIndeterminate(true);
         }
 
-        private void finishedBackup() {
-            int backedUpCount = SmsBackupService.getCurrentSyncedItems();
+        private void finishedBackup(BackupStateChanged state) {
+            int backedUpCount = state.currentSyncedItems;
             String text = null;
             if (backedUpCount == PrefStore.getMaxItemsPerSync(getContext())) {
                 text = getString(R.string.status_backup_done_details_max_per_sync, backedUpCount);
@@ -506,14 +506,14 @@ public class SmsSync extends PreferenceActivity {
             mStatusLabel.setTextColor(getResources().getColor(R.color.status_done));
         }
 
-        private void finishedRestore() {
+        private void finishedRestore(RestoreStateChanged newState) {
             mStatusLabel.setTextColor(getResources().getColor(R.color.status_done));
             mStatusLabel.setText(R.string.status_done);
             mSyncDetailsLabel.setText(getResources().getQuantityString(
                     R.plurals.status_restore_done_details,
-                    SmsRestoreService.getRestoredCount(),
-                    SmsRestoreService.getRestoredCount(),
-                    SmsRestoreService.getDuplicateCount()));
+                    newState.restoredCount,
+                    newState.restoredCount,
+                    newState.duplicateCount));
         }
 
         private void idle() {
@@ -527,17 +527,76 @@ public class SmsSync extends PreferenceActivity {
                             new Date(lastSync).toLocaleString());
         }
 
-        public void stateChanged(final SmsSyncState newState) {
-            if (mView == null) return;
-            setAttributes(newState);
+        @Subscribe  public void restoreStateChanged(final RestoreStateChanged newState) {
+            stateChanged(newState);
+            switch (newState.state) {
+                case RESTORE:
+                    mSyncButton.setEnabled(false);
+                    mRestoreButton.setText(R.string.ui_restore_button_label_restoring);
 
-            switch (newState) {
+                    mStatusLabel.setText(R.string.status_restore);
+
+                    mSyncDetailsLabel.setText(getString(R.string.status_restore_details,
+                            newState.restoredCount,
+                            newState.itemsToRestore));
+
+                    mProgressBar.setIndeterminate(false);
+                    mProgressBar.setProgress(newState.restoredCount);
+                    mProgressBar.setMax(newState.itemsToRestore);
+                    break;
                 case FINISHED_RESTORE:
-                    finishedRestore();
+                    finishedRestore(newState);
                     break;
+
+                case CANCELED_RESTORE:
+                    mStatusLabel.setText(R.string.status_canceled);
+                    mSyncDetailsLabel.setText(getString(R.string.status_restore_canceled_details,
+                            newState.currentRestoredCount,
+                            newState.itemsToRestore));
+                    break;
+                case UPDATING_THREADS:
+                    mProgressBar.setIndeterminate(true);
+                    mSyncDetailsLabel.setText(getString(R.string.status_updating_threads));
+                    break;
+
+            }
+        }
+
+        @Subscribe  public void backupStateChanged(final BackupStateChanged newState) {
+            stateChanged(newState);
+
+            switch (newState.state) {
                 case FINISHED_BACKUP:
-                    finishedBackup();
+                    finishedBackup(newState);
                     break;
+                case BACKUP:
+                    mRestoreButton.setEnabled(false);
+                    mSyncButton.setText(R.string.ui_sync_button_label_syncing);
+                    mStatusLabel.setText(R.string.status_backup);
+
+                    mSyncDetailsLabel.setText(getString(R.string.status_backup_details,
+                            newState.currentSyncedItems,
+                            newState.itemsToSync));
+
+                    mProgressBar.setIndeterminate(false);
+                    mProgressBar.setProgress(newState.currentSyncedItems);
+                    mProgressBar.setMax(newState.itemsToSync);
+                    break;
+                case CANCELED_BACKUP:
+                    mStatusLabel.setText(R.string.status_canceled);
+
+                    mSyncDetailsLabel.setText(getString(R.string.status_canceled_details,
+                            newState.currentSyncedItems,
+                            newState.itemsToSync));
+                    break;
+            }
+        }
+
+        private void stateChanged(StateChanged state) {
+            if (mView == null) return;
+            setAttributes(state.state);
+
+            switch (state.state) {
                 case IDLE:
                     idle();
                     break;
@@ -549,37 +608,6 @@ public class SmsSync extends PreferenceActivity {
                 case CALC:
                     calc();
                     break;
-                case BACKUP:
-                    mRestoreButton.setEnabled(false);
-                    mSyncButton.setText(R.string.ui_sync_button_label_syncing);
-                    mStatusLabel.setText(R.string.status_backup);
-
-                    mSyncDetailsLabel.setText(getString(R.string.status_backup_details,
-                            SmsBackupService.getCurrentSyncedItems(),
-                            SmsBackupService.getItemsToSyncCount()));
-
-                    mProgressBar.setIndeterminate(false);
-                    mProgressBar.setProgress(SmsBackupService.getCurrentSyncedItems());
-                    mProgressBar.setMax(SmsBackupService.getItemsToSyncCount());
-                    break;
-                case RESTORE:
-                    mSyncButton.setEnabled(false);
-                    mRestoreButton.setText(R.string.ui_restore_button_label_restoring);
-
-                    mStatusLabel.setText(R.string.status_restore);
-
-                    mSyncDetailsLabel.setText(getString(R.string.status_restore_details,
-                            SmsRestoreService.getCurrentRestoredItems(),
-                            SmsRestoreService.getItemsToRestoreCount()));
-
-                    mProgressBar.setIndeterminate(false);
-                    mProgressBar.setProgress(SmsRestoreService.getCurrentRestoredItems());
-                    mProgressBar.setMax(SmsRestoreService.getItemsToRestoreCount());
-                    break;
-                case UPDATING_THREADS:
-                    mProgressBar.setIndeterminate(true);
-                    mSyncDetailsLabel.setText(getString(R.string.status_updating_threads));
-                    break;
                 case AUTH_FAILED:
                     authFailed();
                     break;
@@ -588,20 +616,6 @@ public class SmsSync extends PreferenceActivity {
                     mStatusLabel.setText(R.string.status_unknown_error);
                     mSyncDetailsLabel.setText(getString(R.string.status_unknown_error_details,
                             ServiceBase.lastError == null ? "N/A" : ServiceBase.lastError));
-                    break;
-                case CANCELED_BACKUP:
-                    mStatusLabel.setText(R.string.status_canceled);
-
-                    mSyncDetailsLabel.setText(getString(R.string.status_canceled_details,
-                            SmsBackupService.getCurrentSyncedItems(),
-                            SmsBackupService.getItemsToSyncCount()));
-                    break;
-                case CANCELED_RESTORE:
-                    mStatusLabel.setText(R.string.status_canceled);
-
-                    mSyncDetailsLabel.setText(getString(R.string.status_restore_canceled_details,
-                            SmsRestoreService.getCurrentRestoredItems(),
-                            SmsRestoreService.getItemsToRestoreCount()));
                     break;
             }
         }
@@ -648,7 +662,7 @@ public class SmsSync extends PreferenceActivity {
                     // Sync button will be restored on next status update.
                     mSyncButton.setText(R.string.ui_sync_button_label_canceling);
                     mSyncButton.setEnabled(false);
-                    SmsBackupService.cancel();
+                    App.bus.post(new UserCanceled());
                 }
             } else if (v == mRestoreButton) {
                 if (LOCAL_LOGV) Log.v(TAG, "restore");
@@ -657,7 +671,8 @@ public class SmsSync extends PreferenceActivity {
                 } else {
                     mRestoreButton.setText(R.string.ui_sync_button_label_canceling);
                     mRestoreButton.setEnabled(false);
-                    SmsRestoreService.cancel();
+                    App.bus.post(new UserCanceled());
+
                 }
             }
         }
@@ -856,11 +871,6 @@ public class SmsSync extends PreferenceActivity {
                 return null;
         }
         return createMessageDialog(id, title, msg);
-    }
-
-    @Deprecated
-    public StatusPreference getStatusPreference() {
-        return statusPref;
     }
 
     static interface UrlOpener {

@@ -13,6 +13,7 @@ import com.fsck.k9.mail.FetchProfile;
 import com.fsck.k9.mail.Message;
 import com.fsck.k9.mail.MessagingException;
 import com.fsck.k9.mail.internet.BinaryTempFileBody;
+import com.zegoggles.smssync.App;
 import com.zegoggles.smssync.SmsConsts;
 import com.zegoggles.smssync.mail.BackupImapStore;
 import com.zegoggles.smssync.mail.CursorToMessage;
@@ -29,43 +30,20 @@ import java.util.Set;
 
 import static com.zegoggles.smssync.App.LOCAL_LOGV;
 import static com.zegoggles.smssync.App.TAG;
-import static com.zegoggles.smssync.service.ServiceBase.SmsSyncState.*;
+import static com.zegoggles.smssync.service.SmsSyncState.*;
 
 public class SmsRestoreService extends ServiceBase {
-    private static int sCurrentRestoredItems;
-    private static int sItemsToRestoreCount;
-
-    static int sRestoredCount, sDuplicateCount;
-
-
-    public static int getRestoredCount() {
-        return sRestoredCount;
-    }
-
-    public static int getDuplicateCount() {
-        return sDuplicateCount;
-    }
-
     private static boolean sIsRunning = false;
-    private static boolean sCanceled = false;
 
-    public static void cancel() {
-        sCanceled = true;
-    }
+
+    private int mCurrentRestoredItems;
+    private int mItemsToRestoreCount;
 
     public static boolean isWorking() {
         return sIsRunning;
     }
 
-    public static int getCurrentRestoredItems() {
-        return sCurrentRestoredItems;
-    }
-
-    public static int getItemsToRestoreCount() {
-        return sItemsToRestoreCount;
-    }
-
-    class RestoreTask extends AsyncTask<Integer, SmsSyncState, Integer> {
+    class RestoreTask extends AsyncTask<Integer, RestoreStateChanged, RestoreStateChanged> {
         private Set<String> smsIds = new HashSet<String>();
         private Set<String> callLogIds = new HashSet<String>();
         private Set<String> uids = new HashSet<String>();
@@ -74,7 +52,7 @@ public class SmsRestoreService extends ServiceBase {
         private CursorToMessage converter = new CursorToMessage(context, PrefStore.getUserEmail(context));
         private int max;
 
-        protected java.lang.Integer doInBackground(Integer... params) {
+        protected RestoreStateChanged doInBackground(Integer... params) {
             this.max = params.length > 0 ? params[0] : -1;
             final boolean starredOnly = PrefStore.isRestoreStarredOnly(context);
             final boolean restoreCallLog = PrefStore.isRestoreCallLog(context);
@@ -99,13 +77,13 @@ public class SmsRestoreService extends ServiceBase {
                 if (restoreSms) msgs.addAll(smsFolder.getMessages(max, starredOnly, null));
                 if (restoreCallLog) msgs.addAll(callFolder.getMessages(max, starredOnly, null));
 
-                sItemsToRestoreCount = max <= 0 ? msgs.size() : Math.min(msgs.size(), max);
+                mItemsToRestoreCount = max <= 0 ? msgs.size() : Math.min(msgs.size(), max);
 
                 long lastPublished = System.currentTimeMillis();
-                for (int i = 0; i < sItemsToRestoreCount && !sCanceled; i++) {
+                for (int i = 0; i < mItemsToRestoreCount && !mCanceled; i++) {
 
                     importMessage(msgs.get(i));
-                    sCurrentRestoredItems = i;
+                    mCurrentRestoredItems = i;
 
                     msgs.set(i, null); // help gc
 
@@ -123,7 +101,12 @@ public class SmsRestoreService extends ServiceBase {
                 publishProgress(UPDATING_THREADS);
                 updateAllThreads(false);
 
-                return smsIds.size() + callLogIds.size();
+                int restoredCount = smsIds.size() + callLogIds.size();
+                return new RestoreStateChanged(FINISHED_RESTORE,
+                        mCurrentRestoredItems,
+                        mItemsToRestoreCount,
+                        restoredCount,
+                        uids.size() - restoredCount);
             } catch (ConnectivityErrorException e) {
                 lastError = translateException(e);
                 publishProgress(CONNECTIVITY_ERROR);
@@ -146,26 +129,28 @@ public class SmsRestoreService extends ServiceBase {
             }
         }
 
+        protected void publishProgress(SmsSyncState smsSyncState) {
+            publishProgress(new RestoreStateChanged(smsSyncState, mCurrentRestoredItems, mItemsToRestoreCount, -1, -1));
+        }
+
         @Override
-        protected void onPostExecute(Integer result) {
-            if (sCanceled) {
+        protected void onPostExecute(RestoreStateChanged result) {
+            if (mCanceled) {
                 Log.d(TAG, "restore canceled by user");
                 publishProgress(CANCELED_RESTORE);
             } else if (result != null) {
                 Log.d(TAG, "finished (" + result + "/" + uids.size() + ")");
-                sRestoredCount = result;
-                sDuplicateCount = uids.size() - result;
                 publishProgress(FINISHED_RESTORE);
             }
-            sCanceled = false;
+            mCanceled = false;
             sIsRunning = false;
         }
 
         @Override
-        protected void onProgressUpdate(SmsSyncState... progress) {
+        protected void onProgressUpdate(RestoreStateChanged... progress) {
             if (progress == null || progress.length == 0) return;
-            if (smsSync != null) smsSync.getStatusPreference().stateChanged(progress[0]);
-            sState = progress[0];
+            App.bus.post(progress[0]);
+            setState(progress[0]);
         }
 
         private void updateAllThreads(final boolean async) {

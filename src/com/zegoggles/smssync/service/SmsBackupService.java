@@ -31,6 +31,7 @@ import com.fsck.k9.mail.Message;
 import com.fsck.k9.mail.MessagingException;
 import com.fsck.k9.mail.XOAuth2AuthenticationFailedException;
 import com.github.jberkel.whassup.Whassup;
+import com.zegoggles.smssync.App;
 import com.zegoggles.smssync.Consts;
 import com.zegoggles.smssync.MmsConsts;
 import com.zegoggles.smssync.R;
@@ -52,7 +53,7 @@ import java.util.Set;
 import static com.zegoggles.smssync.App.*;
 import static com.zegoggles.smssync.contacts.ContactAccessor.ContactGroup;
 import static com.zegoggles.smssync.preferences.PrefStore.getMaxSyncedDateSms;
-import static com.zegoggles.smssync.service.ServiceBase.SmsSyncState.*;
+import static com.zegoggles.smssync.service.SmsSyncState.*;
 
 public class SmsBackupService extends ServiceBase {
     /** Number of messages sent per sync request. */
@@ -69,18 +70,12 @@ public class SmsBackupService extends ServiceBase {
     /**
      * Number of messages that currently need a sync.
      */
-    private static int sItemsToSync;
+    private int mItemsToSync;
 
     /**
      * Number of messages already synced during this cycle.
      */
-    private static int sCurrentSyncedItems;
-
-    /**
-     * Indicates that the user canceled the current backup and that this service
-     * should finish working ASAP.
-     */
-    private static boolean sCanceled;
+    private int mCurrentSyncedItems;
 
     private boolean isBackground(final Intent intent) {
         return intent.hasExtra(Consts.KEY_NUM_RETRIES);
@@ -130,7 +125,7 @@ public class SmsBackupService extends ServiceBase {
     /**
      * BackupTask does all the work
      */
-    class BackupTask extends AsyncTask<Intent, SmsSyncState, Integer> {
+    class BackupTask extends AsyncTask<Intent, BackupStateChanged, Integer> {
         private final Context context = SmsBackupService.this;
         private final int maxItemsPerSync = PrefStore.getMaxItemsPerSync(context);
         private final ContactGroup groupToBackup = PrefStore.getBackupContactGroup(context);
@@ -171,10 +166,10 @@ public class SmsBackupService extends ServiceBase {
                 whatsAppItems = getWhatsAppItemsToSync(maxItemsPerSync - smsCount - mmsCount - callLogCount);
                 whatsAppItemsCount = whatsAppItems != null ? whatsAppItems.getCount() : 0;
 
-                sCurrentSyncedItems = 0;
-                sItemsToSync = smsCount + mmsCount + callLogCount + whatsAppItemsCount;
+                mCurrentSyncedItems = 0;
+                mItemsToSync = smsCount + mmsCount + callLogCount + whatsAppItemsCount;
 
-                if (sItemsToSync > 0) {
+                if (mItemsToSync > 0) {
                     if (!PrefStore.isLoginInformationSet(context)) {
                         appLog(R.string.app_log_missing_credentials);
 
@@ -258,16 +253,16 @@ public class SmsBackupService extends ServiceBase {
         }
 
         @Override
-        protected void onProgressUpdate(SmsSyncState... progress) {
+        protected void onProgressUpdate(BackupStateChanged... progress) {
             if (progress != null && progress.length > 0) {
-                if (smsSync != null) smsSync.getStatusPreference().stateChanged(progress[0]);
-                sState = progress[0];
+                App.bus.post(progress[0]);
+                setState(progress[0]);
             }
         }
 
         @Override
         protected void onPostExecute(Integer result) {
-            if (sCanceled) {
+            if (mCanceled) {
                 appLog(R.string.app_log_backup_canceled, result);
                 publish(CANCELED_BACKUP);
             } else if (result != null) {
@@ -276,12 +271,12 @@ public class SmsBackupService extends ServiceBase {
                 publish(FINISHED_BACKUP);
             }
             sIsRunning = false;
-            sCanceled = false;
+            mCanceled = false;
         }
 
         private int backup(Cursor smsItems, Cursor mmsItems, Cursor callLogItems, Cursor whatsAppItems)
                 throws MessagingException {
-            Log.i(TAG, String.format(Locale.ENGLISH, "Starting backup (%d messages)", sItemsToSync));
+            Log.i(TAG, String.format(Locale.ENGLISH, "Starting backup (%d messages)", mItemsToSync));
             BackupImapStore store = getBackupImapStore(PrefStore.getStoreUri(SmsBackupService.this));
 
             publish(LOGIN);
@@ -300,7 +295,7 @@ public class SmsBackupService extends ServiceBase {
                 Cursor curCursor;
                 DataType dataType;
                 publish(CALC);
-                while (!sCanceled && (sCurrentSyncedItems < sItemsToSync)) {
+                while (!mCanceled && (mCurrentSyncedItems < mItemsToSync)) {
                     if (smsItems != null && smsItems.moveToNext()) {
                         dataType = DataType.SMS;
                         curCursor = smsItems;
@@ -349,11 +344,11 @@ public class SmsBackupService extends ServiceBase {
                         }
                     }
 
-                    sCurrentSyncedItems += messages.size();
-                    publish(BACKUP);
+                    mCurrentSyncedItems += messages.size();
+                    publishProgress(new BackupStateChanged(BACKUP, mCurrentSyncedItems, mItemsToSync));
                 }
 
-                return sCurrentSyncedItems;
+                return mCurrentSyncedItems;
 
             } finally {
                 if (smsmmsfolder != null) smsmmsfolder.close();
@@ -492,7 +487,7 @@ public class SmsBackupService extends ServiceBase {
 
         protected void publish(SmsSyncState s) {
             if (!background) {
-                publishProgress(s);
+                publishProgress(new BackupStateChanged(s, mCurrentSyncedItems, mItemsToSync));
             } else {
                 if (!PrefStore.isNotificationEnabled(context)) return;
 
@@ -519,7 +514,7 @@ public class SmsBackupService extends ServiceBase {
             updateMaxSyncedDateMms(getMaxItemDateMms());
             updateMaxSyncedDateCallLog(getMaxItemDateCallLog());
 
-            sItemsToSync = sCurrentSyncedItems = 0;
+            mItemsToSync = mCurrentSyncedItems = 0;
             sIsRunning = false;
             publish(IDLE);
             Log.i(TAG, "All messages skipped.");
@@ -527,24 +522,7 @@ public class SmsBackupService extends ServiceBase {
         }
     }
 
-    /**
-     * Cancels the current ongoing backup.
-     */
-    public static void cancel() {
-        if (sIsRunning) {
-            sCanceled = true;
-        }
-    }
-
     public static boolean isWorking() {
         return sIsRunning;
-    }
-
-    public static int getItemsToSyncCount() {
-        return sItemsToSync;
-    }
-
-    public static int getCurrentSyncedItems() {
-        return sCurrentSyncedItems;
     }
 }

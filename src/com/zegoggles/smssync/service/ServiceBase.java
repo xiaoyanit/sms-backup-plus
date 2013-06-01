@@ -32,6 +32,8 @@ import android.provider.CallLog;
 import android.text.format.DateFormat;
 import android.util.Log;
 import com.fsck.k9.mail.MessagingException;
+import com.squareup.otto.Subscribe;
+import com.zegoggles.smssync.App;
 import com.zegoggles.smssync.MmsConsts;
 import com.zegoggles.smssync.R;
 import com.zegoggles.smssync.SmsConsts;
@@ -45,28 +47,24 @@ import com.zegoggles.smssync.utils.AppLog;
 import static com.zegoggles.smssync.App.*;
 
 public abstract class ServiceBase extends Service {
-    // TODO: decouple activity and service using message bus
-    public static SmsSync smsSync;
-
     protected CalendarAccessor calendars = CalendarAccessor.Get.instance();
     protected ContactAccessor contacts = ContactAccessor.Get.instance();
+
+    protected boolean mCanceled = false;
 
     /**
      * Field containing a description of the last error.
      */
     public static String lastError;
 
-    public enum SmsSyncState {
-        IDLE, CALC, LOGIN, BACKUP, RESTORE,
-        AUTH_FAILED, CONNECTIVITY_ERROR, GENERAL_ERROR,
-        CANCELED_BACKUP, CANCELED_RESTORE,
-        FINISHED_BACKUP, FINISHED_RESTORE,
-        UPDATING_THREADS
+    // contains the last known state this service is in
+    private static StateChanged sState = new StateChanged(SmsSyncState.IDLE);
+
+    protected void setState(StateChanged state) {
+        sState = state;
     }
 
-    static SmsSyncState sState = SmsSyncState.IDLE;
-
-    public static SmsSyncState getState() {
+    public static StateChanged getState() {
         return sState;
     }
 
@@ -96,12 +94,17 @@ public abstract class ServiceBase extends Service {
         if (PrefStore.isAppLogEnabled(this)) {
             this.appLog = new AppLog(LOG, DateFormat.getDateFormatOrder(this));
         }
+        App.bus.register(this);
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
         if (appLog != null) appLog.close();
+    }
+
+    @Subscribe public void userCanceled(UserCanceled canceled) {
+        mCanceled = true;
     }
 
     protected BackupImapStore getBackupImapStore(String uri) throws MessagingException {
